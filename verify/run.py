@@ -95,6 +95,48 @@ def smoke() -> None:
     check("commit locks climbed to view 4",
           all(l["locked"]["view"] == 4 for l in verdict.get("locks", {}).values()))
 
+    print("== HTTP smoke: lock evidence chain ==")
+    v0 = submission["validators"][0]
+    status, chain = http("GET", f"/v1/audits/smoke-commit-4/locks/{v0}?view=4")
+    check("lock evidence 200 for a recorded lock",
+          status == 200 and chain.get("queried_lock") == {
+              "block_id": blocks[3], "view": 4},
+          f"got {status} {chain if status != 200 else ''}")
+    evidence = chain.get("evidence", {})
+    check("evidence links the triggering observation",
+          (evidence.get("observation") or {}).get("view") == 4
+          and evidence["observation"].get("validator") == v0)
+    formation = evidence.get("certificate_formation", {})
+    check("evidence names the threshold-forming vote",
+          formation.get("quorum") == 3
+          and formation.get("threshold_vote", {}).get("event_index")
+          == formation.get("formed_at"))
+    votes = evidence.get("votes", [])
+    check("evidence carries the signed quorum, in capture order",
+          len(votes) == 3
+          and [v["event_index"] for v in votes]
+          == sorted(v["event_index"] for v in votes)
+          and len({v["validator"] for v in votes}) == 3
+          and all(v["view"] == 4 and v["block_id"] == blocks[3]
+                  and len(v["signature"]) == 128 for v in votes))
+    parent_chain = chain.get("parent_chain", [])
+    chain_ok = (
+        [h.get("view") for h in parent_chain] == [4, 3, 2, 1, 0]
+        and parent_chain[-1].get("genesis") is True
+        and all(hop.get("parent_id") == parent.get("block_id")
+                and hop.get("certificate", {}).get("block_id")
+                == parent.get("block_id")
+                for hop, parent in zip(parent_chain, parent_chain[1:]))
+    )
+    check("parent chain runs continuously back to genesis",
+          chain_ok, f"got {parent_chain}")
+    # historical lock views stay auditable
+    status, old = http("GET", f"/v1/audits/smoke-commit-4/locks/{v0}?view=1")
+    check("historical lock view still resolvable",
+          status == 200
+          and old.get("queried_lock") == {"block_id": blocks[0], "view": 1},
+          f"got {status}")
+
     print("== HTTP smoke: commit trajectory (n=7) ==")
     builder7, blocks7 = trajgen.build_commit_trajectory("smoke-commit-7", 7, 3)
     status, verdict7 = http("POST", "/v1/audits", builder7.submission())
@@ -122,7 +164,12 @@ def smoke() -> None:
 
     print("== HTTP smoke: reject trajectories ==")
     unsafe, offending = trajgen.build_unsafe_vote_trajectory("smoke-unsafe")
-    status, verdict = http("POST", "/v1/audits", unsafe.submission())
+    unsafe_submission = unsafe.submission()
+    # an observation captured *after* the violating event: it must never be
+    # able to back a lock, even though the certificate itself formed earlier
+    unsafe_submission["events"].append(
+        unsafe.observe(1, unsafe.events[0]["block_id"], 1))
+    status, verdict = http("POST", "/v1/audits", unsafe_submission)
     check("unsafe vote frozen at earliest event",
           status == 201 and verdict.get("status") == "rejected"
           and verdict.get("violation", {}).get("type") == "unsafe_vote"
@@ -130,6 +177,64 @@ def smoke() -> None:
           f"got {status} {verdict.get('violation')}")
     check("frozen trajectory yields no commits",
           verdict.get("committed") == [])
+
+    # evidence query boundaries on the frozen trajectory
+    uv0 = unsafe.pubkeys[0]
+    uv1 = unsafe.pubkeys[1]
+    frozen_block = unsafe.events[0]["block_id"]
+    status, locked = http(
+        "GET", f"/v1/audits/smoke-unsafe/locks/{uv0}?view=1")
+    check("pre-freeze lock evidence still served",
+          status == 200 and locked.get("frozen") is True
+          and locked.get("freeze", {}).get("event_index") == offending
+          and locked.get("evidence", {}).get("observation", {})
+          .get("event_index") == 4,
+          f"got {status} {locked if status != 200 else ''}")
+    status, body = http(
+        "GET", f"/v1/audits/smoke-unsafe/locks/{uv1}?view=1")
+    check("lock appearing only after freeze is refused",
+          status == 404
+          and body.get("error", {}).get("code") == "lock_view_not_recorded",
+          f"got {status} {body}")
+    status, body = http(
+        "GET", f"/v1/audits/smoke-unsafe/locks/{uv0}?view=2")
+    check("unrecorded lock view refused on frozen audit",
+          status == 404
+          and body.get("error", {}).get("code") == "lock_view_not_recorded",
+          f"got {status} {body}")
+    outsider = "01" * 32
+    status, body = http(
+        "GET", f"/v1/audits/smoke-unsafe/locks/{outsider}?view=1")
+    check("unknown validator refused",
+          status == 404
+          and body.get("error", {}).get("code") == "unknown_validator",
+          f"got {status} {body}")
+    status, body = http(
+        "GET", f"/v1/audits/smoke-unsafe/locks/{uv0}")
+    check("missing view parameter rejected",
+          status == 400
+          and body.get("error", {}).get("code") == "invalid_query",
+          f"got {status} {body}")
+    status, body = http(
+        "GET", f"/v1/audits/never-existed/locks/{uv0}?view=1")
+    check("evidence for unknown audit refused",
+          status == 404
+          and body.get("error", {}).get("code") == "not_found",
+          f"got {status} {body}")
+    status, body = http(
+        "GET", f"/v1/audits/smoke-unsafe/locks/{uv0}"
+        f"?view=1&block_id={'ab' * 32}")
+    check("mismatched block_id refused",
+          status == 404
+          and body.get("error", {}).get("code")
+          == "lock_view_not_recorded",
+          f"got {status} {body}")
+    status, matching = http(
+        "GET", f"/v1/audits/smoke-unsafe/locks/{uv0}"
+        f"?view=1&block_id={frozen_block}")
+    check("matching block_id accepted",
+          status == 200 and matching.get("queried_lock", {}).get("block_id")
+          == frozen_block, f"got {status}")
 
     bad_sig = trajgen.TrajectoryBuilder("smoke-bad-signature", 4)
     block = bad_sig.propose(0, 1, (bad_sig.genesis_id, 0))

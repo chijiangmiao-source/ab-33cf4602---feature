@@ -88,6 +88,7 @@ Port is configurable via `PORT` (default 8080). All bodies are JSON.
 | `GET` | `/health` | Liveness: `200 {"status":"ok"}` |
 | `POST` | `/v1/audits` | Submit a trajectory for audit |
 | `GET` | `/v1/audits/{audit_id}` | Fetch the stored verdict (`404` if none) |
+| `GET` | `/v1/audits/{audit_id}/locks/{validator}?view=V` | Stable evidence chain for one recorded lock |
 
 `POST /v1/audits` responses:
 
@@ -141,6 +142,55 @@ Violation types: `missing_certificate`, `invalid_signature`,
 `invalid_block_hash`, `invalid_view`, `double_vote`, `unknown_block`,
 `view_mismatch`, `unsafe_vote`.
 
+### Lock evidence
+
+A lock summary cannot, by itself, justify an unlock.  The lock-evidence
+read lets an auditor pick a validator and one of that validator's
+*recorded* lock views (`?view=V`; view `0` is the implicit genesis lock
+and is only addressable while the validator is still on genesis) and
+returns a chain rebuilt from a fresh deterministic replay of the stored
+trajectory:
+
+* `evidence.observation` — the captured `qc_observation` event (index,
+  block, view, validator) that moved the lock;
+* `evidence.proposal` — the captured proposal event that formed the
+  locked block;
+* `evidence.certificate_formation` — the vote event at which 2f+1
+  distinct signers first reached the threshold (`formed_at`, with the
+  `threshold_vote` record), and the quorum size;
+* `evidence.votes` — every signed vote contributing to that
+  certificate, in capture order, each with its event index, block,
+  view, validator and Ed25519 signature (re-verifiable against the
+  canonical vote message);
+* `parent_chain` — the locked block's proposal-parent chain back to
+  genesis where every non-genesis hop carries the certificate
+  referencing its parent, so each hop's `parent_id` equals the next
+  hop's certified block (the final hop is the implicit genesis
+  certificate).
+
+Every item is attributable (event index, block, view, validator) and is
+derived only from events actually processed: a lock whose observation
+or certificate formation occurs at or after the freeze violation is
+refused with no evidence fabricated from later events.  A response for a
+frozen audit carries `"frozen": true` and a `freeze` descriptor
+`{event_index, type}`.
+
+Query refusals:
+
+* `404 not_found` — no such audit;
+* `404 unknown_validator` — the public key is not in the audit's
+  validator set;
+* `404 lock_view_not_recorded` — the validator never had a recorded
+  lock at that view in the processed prefix (including locks that would
+  only form after a freeze);
+* `400 invalid_query` — missing/duplicate/non-integer/negative `view`,
+  malformed validator or `block_id`;
+* `409 evidence_unavailable` — a verdict stored by an older build
+  without the captured submission (resubmit to enable).
+
+An optional `block_id` query parameter additionally pins the expected
+locked block and is refused (`404 lock_view_not_recorded`) on mismatch.
+
 ## Run
 
 ```sh
@@ -161,8 +211,9 @@ performs the whole review in one run and exits with the result status:
 2. runs the lock-rule unit tests (Ed25519 vectors, consensus rules, API);
 3. waits for the healthy `audit` container and runs HTTP smoke checks:
    commit trajectories for 4 and 7 validators, reject trajectories (unsafe
-   vote, invalid signature, missing certificate), idempotent replay, and
-   conflict handling.
+   vote, invalid signature, missing certificate), idempotent replay,
+   conflict handling, and lock-evidence chain queries (valid chain,
+   historical lock, frozen-trajectory boundaries).
 
 Exit code `0` means everything passed; any failure exits `1`.
 
@@ -178,10 +229,11 @@ app/
   canonical.py   canonical UTF-8 vote/block encodings and digests
   schema.py      structural validation of submissions (HTTP 400)
   consensus.py   lock-rule engine, certificate formation, 3-chain commits
+  evidence.py    lock evidence chains (observation -> formation -> votes)
   store.py       idempotent verdict store (replay / conflict)
-  server.py      HTTP API (PORT env, /health, two audit operations)
+  server.py      HTTP API (PORT env, health, audit and lock-evidence reads)
   healthcheck.py container HEALTHCHECK
   trajgen.py     deterministic signed-trajectory builder (tests/verify)
-tests/           Ed25519 vectors, lock-rule tests, in-process API tests
+tests/           Ed25519 vectors, lock-rule tests, evidence/API tests
 verify/run.py    one-shot verify: unit tests + HTTP smoke, exit code
 ```

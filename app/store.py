@@ -1,9 +1,11 @@
 """Idempotent verdict store.
 
-Maps a stable audit identifier to the digest of the submission and the
-verdict it produced.  Retransmitting the same identifier with semantically
-identical content replays the original verdict; the same identifier with
-different content is an explicit conflict.
+Maps a stable audit identifier to the digest of the submission, the
+verdict it produced, and the original submission (so read-side evidence
+chains can be rebuilt after a restart).  Retransmitting the same
+identifier with semantically identical content replays the original
+verdict; the same identifier with different content is an explicit
+conflict.
 
 Records live in memory; when ``AUDIT_STORE_FILE`` points at a path the store
 is also persisted there (atomic rewrite) so a container restart keeps prior
@@ -49,9 +51,22 @@ class AuditStore:
             record = self._records.get(audit_id)
             return None if record is None else dict(record["verdict"])
 
-    def put(self, audit_id: str, digest: str, verdict: dict) -> None:
+    def get_submission(self, audit_id: str):
+        """Return the stored submission for an audit id, if available."""
         with self._lock:
-            self._records[audit_id] = {"digest": digest, "verdict": verdict}
+            record = self._records.get(audit_id)
+            if record is None or record.get("submission") is None:
+                return None
+            return json.loads(json.dumps(record["submission"]))
+
+    def put(self, audit_id: str, digest: str, verdict: dict,
+            submission: dict | None = None) -> None:
+        with self._lock:
+            self._records[audit_id] = {
+                "digest": digest,
+                "verdict": verdict,
+                "submission": submission,
+            }
             self._persist_locked()
 
     def _persist_locked(self) -> None:

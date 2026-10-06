@@ -4,6 +4,8 @@ Endpoints:
     GET  /health                 liveness probe
     POST /v1/audits              submit a trajectory for audit
     GET  /v1/audits/{audit_id}   fetch the stored verdict for an audit id
+    GET  /v1/audits/{audit_id}/locks/{validator}?view=V
+                                 stable evidence chain for a recorded lock
 
 The listen port is configurable through the ``PORT`` environment variable
 (default 8080).  Only the Python standard library is used.
@@ -16,11 +18,16 @@ import logging
 import os
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
-from . import canonical, consensus, schema, store as store_mod
+from . import canonical, consensus, evidence, schema, store as store_mod
 
 MAX_BODY_BYTES = 1 << 20  # 1 MiB
 _AUDIT_PATH_RE = re.compile(r"^/v1/audits/([A-Za-z0-9][A-Za-z0-9._:\-]{0,127})$")
+_LOCK_PATH_RE = re.compile(
+    r"^/v1/audits/([A-Za-z0-9][A-Za-z0-9._:\-]{0,127})"
+    r"/locks/([^/]{1,128})$")
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 
 LOG = logging.getLogger("lock-audit")
 
@@ -60,9 +67,15 @@ class Handler(BaseHTTPRequestHandler):
     # -- GET ------------------------------------------------------------------
 
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path == "/health":
             self._send_json(200, {"status": "ok", "service": "lock-audit"})
+            return
+        lock_match = _LOCK_PATH_RE.match(path)
+        if lock_match:
+            self._handle_lock_evidence(lock_match.group(1),
+                                       lock_match.group(2), parsed.query)
             return
         match = _AUDIT_PATH_RE.match(path)
         if match:
@@ -74,6 +87,69 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, verdict)
             return
         self._send_error(404, "not_found", "unknown path")
+
+    def _handle_lock_evidence(self, audit_id: str, validator: str,
+                              query_string: str):
+        if not _HEX64_RE.match(validator):
+            self._send_error(400, "invalid_query",
+                             "validator must be 64 lowercase hex chars")
+            return
+        query = parse_qs(query_string)
+        if "view" not in query or len(query["view"]) != 1:
+            self._send_error(
+                400, "invalid_query",
+                "lock evidence requires exactly one 'view' query parameter")
+            return
+        raw_view = query["view"][0]
+        if not raw_view.isascii() or not raw_view.isdigit():
+            self._send_error(400, "invalid_query",
+                             "'view' must be a non-negative integer")
+            return
+        view = int(raw_view)
+
+        if self.audit_store.get(audit_id) is None:
+            self._send_error(404, "not_found",
+                             "no verdict stored for this audit_id")
+            return
+        submission = self.audit_store.get_submission(audit_id)
+        if submission is None:
+            self._send_error(
+                409, "evidence_unavailable",
+                "the stored verdict predates evidence capture and cannot be "
+                "rebuilt; resubmit the trajectory")
+            return
+
+        expected_block = None
+        if "block_id" in query:
+            if len(query["block_id"]) != 1:
+                self._send_error(400, "invalid_query",
+                                 "at most one 'block_id' query parameter allowed")
+                return
+            expected_block = query["block_id"][0]
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_block):
+                self._send_error(400, "invalid_query",
+                                 "'block_id' must be 64 lowercase hex chars")
+                return
+
+        # Re-derive every conclusion from the stored trajectory: the evidence
+        # endpoint never reads mutable summaries, only a fresh deterministic
+        # replay, so post-freeze events can never feed the chain.
+        engine = consensus.Engine(submission)
+        engine.run()
+        try:
+            result = evidence.lock_evidence(engine, validator, view)
+        except evidence.EvidenceError as exc:
+            self._send_error(exc.status, exc.code, exc.message)
+            return
+        if expected_block is not None \
+                and result["queried_lock"]["block_id"] != expected_block:
+            self._send_error(
+                404, "lock_view_not_recorded",
+                f"validator {validator} is not locked on block "
+                f"{expected_block} at view {view}; recorded lock block is "
+                f"{result['queried_lock']['block_id']}")
+            return
+        self._send_json(200, result)
 
     # -- POST -----------------------------------------------------------------
 
@@ -123,7 +199,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         verdict = consensus.Engine(submission).run()
-        self.audit_store.put(audit_id, digest, verdict)
+        self.audit_store.put(audit_id, digest, verdict, submission)
         verdict = dict(verdict)
         verdict["replayed"] = False
         self._send_json(201, verdict)

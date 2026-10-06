@@ -85,8 +85,15 @@ class Engine:
         self.locks = {v: (self.genesis_id, 0) for v in self.validators}
         self.lock_history = {v: [] for v in self.validators}
 
-        self.votes = {}  # (block_id, view) -> [validator, ...] in arrival order
+        # (block_id, view) -> arrival-order vote records, each carrying the
+        # capture event index and the (already verified) signature, so audits
+        # can attribute certificate formation to concrete captured votes.
+        self.votes: dict[tuple, list[dict]] = {}
         self.voted = {}  # (validator, view) -> block_id
+
+        # block_id -> {"event_index", "proposer"} of the proposal that first
+        # introduced the block (identical re-proposals do not overwrite it).
+        self.proposal_events: dict[str, dict] = {}
 
         self.committed_tip = self.genesis_id
         self.committed = []  # flat list of newly committed block ids, in order
@@ -161,6 +168,10 @@ class Engine:
         self.blocks[ev["block_id"]] = _Block(
             ev["block_id"], ev["view"], ev["parent_id"], qc_block, qc_view,
             proposer, payload)
+        self.proposal_events[ev["block_id"]] = {
+            "event_index": index,
+            "proposer": proposer,
+        }
         return True
 
     def _apply_vote(self, index, ev):
@@ -205,14 +216,18 @@ class Engine:
                 f"(justify view {justify_view})")
 
         self.voted[(validator, view)] = block_id
-        self.votes.setdefault((block_id, view), []).append(validator)
+        self.votes.setdefault((block_id, view), []).append({
+            "validator": validator,
+            "event_index": index,
+            "signature": ev["signature"],
+        })
 
         key = (block_id, view)
         if key not in self.certificates and len(self.votes[key]) >= self.quorum:
             self.certificates[key] = {
                 "block_id": block_id,
                 "view": view,
-                "signers": list(self.votes[key]),
+                "signers": [r["validator"] for r in self.votes[key]],
                 "formed_at": index,
                 "implicit": False,
             }
