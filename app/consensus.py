@@ -38,13 +38,27 @@ VIEW_MISMATCH = "view_mismatch"
 INVALID_SIGNATURE = "invalid_signature"
 UNSAFE_VOTE = "unsafe_vote"
 
+# Read-path evidence errors (raised by Engine.lock_evidence).
+LOCK_VIEW_NOT_FOUND = "lock_view_not_found"
+EVIDENCE_UNAVAILABLE = "evidence_unavailable"
+
+
+class EvidenceError(Exception):
+    """A lock-evidence query cannot be answered from the replayed state."""
+
+    def __init__(self, code, message, status=404):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status = status
+
 
 class _Block:
     __slots__ = ("block_id", "view", "parent_id", "qc_block_id", "qc_view",
-                 "proposer", "payload")
+                 "proposer", "payload", "proposed_at")
 
     def __init__(self, block_id, view, parent_id, qc_block_id, qc_view,
-                 proposer, payload):
+                 proposer, payload, proposed_at):
         self.block_id = block_id
         self.view = view
         self.parent_id = parent_id
@@ -52,6 +66,7 @@ class _Block:
         self.qc_view = qc_view
         self.proposer = proposer
         self.payload = payload
+        self.proposed_at = proposed_at
 
 
 class Engine:
@@ -69,7 +84,7 @@ class Engine:
         self.genesis_id = genesis["id"]
         self.blocks = {
             self.genesis_id: _Block(self.genesis_id, 0, None, None, None,
-                                    None, ""),
+                                    None, "", None),
         }
         # The genesis certificate is implicit: formed from the start.
         self.certificates = {}  # (block_id, view) -> record
@@ -84,8 +99,12 @@ class Engine:
 
         self.locks = {v: (self.genesis_id, 0) for v in self.validators}
         self.lock_history = {v: [] for v in self.validators}
+        # Accepted qc_observation events per validator, in capture order;
+        # each entry is (event_index, block_id, view).
+        self.observations = {v: [] for v in self.validators}
 
         self.votes = {}  # (block_id, view) -> [validator, ...] in arrival order
+        self.vote_events = {}  # (block_id, view) -> [event index, ...]
         self.voted = {}  # (validator, view) -> block_id
 
         self.committed_tip = self.genesis_id
@@ -160,7 +179,7 @@ class Engine:
 
         self.blocks[ev["block_id"]] = _Block(
             ev["block_id"], ev["view"], ev["parent_id"], qc_block, qc_view,
-            proposer, payload)
+            proposer, payload, index)
         return True
 
     def _apply_vote(self, index, ev):
@@ -205,9 +224,10 @@ class Engine:
                 f"(justify view {justify_view})")
 
         self.voted[(validator, view)] = block_id
-        self.votes.setdefault((block_id, view), []).append(validator)
-
         key = (block_id, view)
+        self.votes.setdefault(key, []).append(validator)
+        self.vote_events.setdefault(key, []).append(index)
+
         if key not in self.certificates and len(self.votes[key]) >= self.quorum:
             self.certificates[key] = {
                 "block_id": block_id,
@@ -237,6 +257,8 @@ class Engine:
                 f"observed certificate ({ev['block_id']}, view {ev['view']}) "
                 "has not reached the 2f+1 threshold")
 
+        self.observations[validator].append(
+            (index, ev["block_id"], ev["view"]))
         locked_block, locked_view = self.locks[validator]
         if ev["view"] > locked_view:
             self.locks[validator] = (ev["block_id"], ev["view"])
@@ -308,6 +330,221 @@ class Engine:
                 break  # frozen at the earliest offending event
             self.events_processed = index + 1
         return self.verdict()
+
+    # -- lock evidence read path ----------------------------------------------
+
+    def lock_evidence(self, validator: str, view: int) -> dict:
+        """Build the stable evidence chain behind one recorded validator lock.
+
+        The queried lock must be a view the validator actually reached through
+        an accepted ``qc_observation`` in the replayed (and, when frozen,
+        pre-violation) prefix.  Every cited event index, block, view and
+        signature comes from that prefix; later events are never consulted and
+        never used to back-fill evidence.
+        """
+        if validator not in self.validator_set:
+            raise EvidenceError(
+                "unknown_validator",
+                f"validator {validator} is not registered for this audit",
+                status=404)
+
+        record = None
+        for entry in self.lock_history[validator]:
+            if entry["view"] == view:
+                record = entry
+                break
+        if record is None:
+            current_view = self.locks[validator][1]
+            if self.violation is not None and view > current_view:
+                # The requested lock can only exist beyond the replay horizon:
+                # it would first form at or after the freeze event.
+                raise EvidenceError(
+                    EVIDENCE_UNAVAILABLE,
+                    f"validator {validator} has no recorded lock at view "
+                    f"{view} within the {self.events_processed} replayed "
+                    f"event(s); its last recorded lock is view {current_view} "
+                    "and a lock forming after the freeze violation is never "
+                    "back-filled from later events")
+            raise EvidenceError(
+                LOCK_VIEW_NOT_FOUND,
+                f"validator {validator} has no recorded lock at view {view}")
+
+        obs_index = record["event_index"]
+        locked_block = record["block_id"]
+        locked_view = record["view"]
+        cert = self.certificates.get((locked_block, locked_view))
+        # A recorded history entry always points at a certificate that was
+        # present when the observation was accepted; guard regardless so the
+        # read path never fabricates one.
+        if cert is None or cert.get("implicit"):
+            raise EvidenceError(
+                EVIDENCE_UNAVAILABLE,
+                f"no threshold certificate backs the lock at view {locked_view}")
+
+        if obs_index >= self.events_processed:
+            # Defensive: the triggering observation must itself be inside the
+            # replayed prefix, never reconstructed from later events.
+            raise EvidenceError(
+                EVIDENCE_UNAVAILABLE,
+                "the triggering observation lies beyond the replay horizon")
+
+        observation_event = self.events[obs_index]
+        if (observation_event.get("validator") != validator
+                or observation_event.get("block_id") != locked_block
+                or observation_event.get("view") != locked_view):
+            raise EvidenceError(
+                EVIDENCE_UNAVAILABLE,
+                "the triggering observation event does not match the record")
+
+        chain = self._lock_chain_refs(locked_block)
+
+        forming_votes = []
+        for idx, signer in zip(self.vote_events[(locked_block, locked_view)],
+                               self.votes[(locked_block, locked_view)]):
+            vote_event = self.events[idx]
+            if (vote_event.get("validator") != signer
+                    or vote_event.get("block_id") != locked_block
+                    or vote_event.get("view") != locked_view
+                    or idx >= self.events_processed):
+                raise EvidenceError(
+                    EVIDENCE_UNAVAILABLE,
+                    "a forming vote lies outside the replayed prefix")
+            forming_votes.append({
+                "event_index": idx,
+                "block_id": locked_block,
+                "view": locked_view,
+                "validator": signer,
+                "signature": vote_event["signature"],
+            })
+
+        formation_event = self.events[cert["formed_at"]]
+        if (formation_event.get("block_id") != locked_block
+                or formation_event.get("view") != locked_view
+                or cert["formed_at"] >= self.events_processed):
+            raise EvidenceError(
+                EVIDENCE_UNAVAILABLE,
+                "the certificate formation event lies outside the replayed "
+                "prefix")
+
+        return {
+            "audit_id": self.audit_id,
+            "query": {
+                "validator": validator,
+                "view": view,
+            },
+            "status": self.verdict()["status"],
+            "events_processed": self.events_processed,
+            "locked": {
+                "block_id": locked_block,
+                "view": locked_view,
+            },
+            "observation": {
+                "event_index": obs_index,
+                "type": "qc_observation",
+                "block_id": locked_block,
+                "view": locked_view,
+                "validator": validator,
+            },
+            "certificate": {
+                "block_id": locked_block,
+                "view": locked_view,
+                "quorum": self.quorum,
+                "formed_at": cert["formed_at"],
+                "formation_event": {
+                    "event_index": cert["formed_at"],
+                    "type": "vote",
+                    "block_id": locked_block,
+                    "view": locked_view,
+                    "validator": formation_event["validator"],
+                },
+                "signers": list(cert["signers"]),
+                "forming_votes": forming_votes,
+            },
+            "parent_chain": chain,
+        }
+
+    def _lock_chain_refs(self, locked_block: str) -> list:
+        """Continuous certificate references from ``locked_block``'s
+        justifying certificate down the proposal parent links to genesis.
+
+        The first hop is the certificate embedded in the locked block's
+        proposal; each subsequent hop is the certificate referenced by the
+        parent block's own proposal.  Every hop asserts that the proposal's
+        parent block equals the block the referenced certificate certifies, so
+        the auditor can confirm each parent/certificate pair agrees.
+        """
+        chain = []
+        current = locked_block
+        seen = set()
+        while current != self.genesis_id:
+            if current in seen:
+                raise EvidenceError(
+                    EVIDENCE_UNAVAILABLE,
+                    "parent chain cycles before reaching genesis")
+            seen.add(current)
+            block = self.blocks.get(current)
+            if block is None or block.proposed_at is None:
+                raise EvidenceError(
+                    EVIDENCE_UNAVAILABLE,
+                    f"block {current} on the parent chain is not known")
+            if block.proposed_at >= self.events_processed:
+                raise EvidenceError(
+                    EVIDENCE_UNAVAILABLE,
+                    f"block {current} is only proposed beyond the replay "
+                    "horizon")
+            qc_key = (block.qc_block_id, block.qc_view)
+            qc = self.certificates.get(qc_key)
+            if qc is None:
+                raise EvidenceError(
+                    EVIDENCE_UNAVAILABLE,
+                    f"referenced certificate ({block.qc_block_id}, view "
+                    f"{block.qc_view}) for block {current} never formed")
+            if block.parent_id != block.qc_block_id:
+                raise EvidenceError(
+                    EVIDENCE_UNAVAILABLE,
+                    f"block {current} parent does not match its certificate")
+            if not qc.get("implicit") and (
+                    qc["formed_at"] is None
+                    or qc["formed_at"] >= self.events_processed):
+                raise EvidenceError(
+                    EVIDENCE_UNAVAILABLE,
+                    f"certificate for {block.qc_block_id} forms beyond the "
+                    "replay horizon")
+            is_implicit = bool(qc.get("implicit", False))
+            chain.append({
+                "block_id": current,
+                "block_view": block.view,
+                "proposal_event_index": block.proposed_at,
+                "proposer": block.proposer,
+                "parent_block_id": block.parent_id,
+                "certificate": {
+                    "block_id": qc["block_id"],
+                    "view": qc["view"],
+                    "implicit": is_implicit,
+                    "formed_at": qc["formed_at"],
+                    "signers": list(qc["signers"]),
+                },
+                "parent_matches_certified_block":
+                    block.parent_id == qc["block_id"],
+                "reaches_genesis": is_implicit,
+            })
+            if is_implicit:
+                if block.parent_id != self.genesis_id:
+                    raise EvidenceError(
+                        EVIDENCE_UNAVAILABLE,
+                        "implicit genesis certificate cited off genesis")
+                break
+            current = block.parent_id
+        else:  # pragma: no cover - every chain ends via the implicit genesis cert
+            raise EvidenceError(
+                EVIDENCE_UNAVAILABLE,
+                "parent chain reached genesis without its implicit certificate")
+        if not chain[-1]["reaches_genesis"] \
+                or chain[-1]["parent_block_id"] != self.genesis_id:
+            raise EvidenceError(
+                EVIDENCE_UNAVAILABLE,
+                "parent chain does not run back to genesis")
+        return chain
 
     def verdict(self):
         certificates = [

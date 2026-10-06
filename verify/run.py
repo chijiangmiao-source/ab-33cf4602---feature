@@ -149,6 +149,103 @@ def smoke() -> None:
           and verdict.get("violation", {}).get("type") == "missing_certificate",
           f"got {status} {verdict.get('violation')}")
 
+    print("== HTTP smoke: lock evidence chains ==")
+    # The accepted n=4 trajectory from earlier is stored as smoke-commit-4;
+    # query a historical (view 2) and the final (view 4) lock for validator 0.
+    v0 = submission["validators"][0]
+    genesis_id = submission["genesis"]["id"]
+    for view, block in ((2, blocks[1]), (4, blocks[3])):
+        status, ev = http(
+            "GET",
+            f"/v1/audits/smoke-commit-4/locks/{v0}?view={view}")
+        check(f"lock evidence view {view} returns 200", status == 200,
+              f"got {status} {ev}")
+        check(f"lock evidence view {view} names the lock",
+              ev.get("locked") == {"block_id": block, "view": view},
+              f"got {ev.get('locked')}")
+        obs = ev.get("observation", {})
+        check(f"lock evidence view {view} cites the triggering observation "
+              "with index/block/view/validator",
+              obs.get("type") == "qc_observation"
+              and isinstance(obs.get("event_index"), int)
+              and obs.get("block_id") == block and obs.get("view") == view
+              and obs.get("validator") == v0,
+              f"got {obs}")
+        cert = ev.get("certificate", {})
+        forming = cert.get("forming_votes", [])
+        check(f"lock evidence view {view} carries 2f+1 signed forming votes",
+              cert.get("quorum") == 3 and len(forming) == 3
+              and all(len(f.get("signature", "")) == 128
+                      and f.get("block_id") == block and f.get("view") == view
+                      and isinstance(f.get("event_index"), int)
+                      for f in forming),
+              f"got {cert}")
+        check(f"lock evidence view {view} forms before the observation",
+              cert.get("formed_at") == cert.get("formation_event", {}).get(
+                  "event_index")
+              and cert.get("formed_at", 1 << 30) < obs.get("event_index", -1),
+              f"formed_at={cert.get('formed_at')} obs={obs.get('event_index')}")
+        chain = ev.get("parent_chain", [])
+        check(f"lock evidence view {view} runs a continuous parent chain to "
+              "genesis",
+              len(chain) == view
+              and all(h.get("parent_matches_certified_block") for h in chain)
+              and chain[-1].get("reaches_genesis") is True
+              and chain[-1].get("parent_block_id") == genesis_id
+              and chain[-1].get("certificate", {}).get("implicit") is True
+              and all(chain[i]["parent_block_id"] == chain[i + 1]["block_id"]
+                      for i in range(len(chain) - 1)),
+              f"got {chain}")
+
+    print("== HTTP smoke: lock evidence frozen-trajectory boundaries ==")
+    frozen_builder, frozen_index, later_block = \
+        trajgen.build_frozen_trajectory_with_later_lock("smoke-evidence-frozen")
+    frozen_submission = frozen_builder.submission()
+    status, frozen_verdict = http("POST", "/v1/audits", frozen_submission)
+    check("frozen evidence trajectory rejected",
+          status == 201 and frozen_verdict.get("status") == "rejected"
+          and frozen_verdict.get("violation", {}).get("event_index")
+          == frozen_index,
+          f"got {status}")
+    fv0 = frozen_submission["validators"][0]
+    status, pre = http(
+        "GET", f"/v1/audits/smoke-evidence-frozen/locks/{fv0}?view=1")
+    check("pre-freeze lock evidence is served from the replayed prefix",
+          status == 200 and pre.get("status") == "rejected"
+          and pre.get("events_processed") == frozen_index
+          and all(f["event_index"] < frozen_index
+                  for f in pre.get("certificate", {}).get("forming_votes", [])),
+          f"got {status} {pre}")
+    status, body = http(
+        "GET", f"/v1/audits/smoke-evidence-frozen/locks/{fv0}?view=2")
+    check("post-freeze lock is refused without back-filling",
+          status == 409 and body.get("error", {}).get("code")
+          == "evidence_unavailable",
+          f"got {status} {body}")
+    status, pre = http(
+        "GET", f"/v1/audits/smoke-evidence-frozen/locks/{fv0}?view=1")
+    leaked = later_block in json.dumps(pre)
+    check("post-freeze block never leaks into pre-freeze evidence",
+          not leaked, "later block present in evidence payload")
+    # unknown audit / unknown validator / never-recorded view stay explicit
+    status, body = http(
+        "GET", f"/v1/audits/no-such-audit/locks/{fv0}?view=1")
+    check("evidence for unknown audit is 404", status == 404,
+          f"got {status}")
+    status, body = http(
+        "GET", f"/v1/audits/smoke-evidence-frozen/locks/{'ab' * 32}?view=1")
+    check("evidence for unknown validator is 404",
+          status == 404 and body.get("error", {}).get("code")
+          == "unknown_validator", f"got {status} {body}")
+    status, body = http(
+        "GET", f"/v1/audits/smoke-evidence-frozen/locks/{fv0}?view=9")
+    check("evidence for a never-recorded future view is refused",
+          status in (404, 409), f"got {status} {body}")
+    status, body = http(
+        "GET", f"/v1/audits/smoke-evidence-frozen/locks/{fv0}")
+    check("evidence without view parameter is 400", status == 400,
+          f"got {status}")
+
     print("== HTTP smoke: envelope errors ==")
     status, body = http("GET", "/v1/audits/never-submitted")
     check("unknown audit id 404", status == 404, f"got {status}")

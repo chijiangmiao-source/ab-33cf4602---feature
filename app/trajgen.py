@@ -126,3 +126,23 @@ def build_unsafe_vote_trajectory(audit_id: str) -> tuple[TrajectoryBuilder, int]
     offending_index = len(builder.events)
     builder.vote(0, 2, rival)                   # unsafe: no extension, no unlock
     return builder, offending_index
+
+
+def build_frozen_trajectory_with_later_lock(
+        audit_id: str) -> tuple[TrajectoryBuilder, int, str]:
+    """A trajectory frozen by an unsafe view-2 vote, *followed* by events that
+    would have locked validator 0 on a certified main-chain view-2 block.
+
+    The post-freeze suffix is a trap for the evidence read path: replaying
+    stops at the violation, so validator 0's only recorded lock is view 1 and
+    the view-2 lock must never be reconstructed from the later events.
+    Returns the builder, the violating event index and the later block id.
+    """
+    builder, offending_index = build_unsafe_vote_trajectory(audit_id)
+    block1 = builder.events[0]["block_id"]
+
+    later = builder.propose(1, 2, (block1, 1), payload="main-2")
+    for voter in range(3):
+        builder.vote(voter, 2, later)          # certificate for later@2
+    builder.observe(0, later, 2)               # would move the lock to view 2
+    return builder, offending_index, later

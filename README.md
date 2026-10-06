@@ -88,6 +88,7 @@ Port is configurable via `PORT` (default 8080). All bodies are JSON.
 | `GET` | `/health` | Liveness: `200 {"status":"ok"}` |
 | `POST` | `/v1/audits` | Submit a trajectory for audit |
 | `GET` | `/v1/audits/{audit_id}` | Fetch the stored verdict (`404` if none) |
+| `GET` | `/v1/audits/{audit_id}/locks/{validator}?view=v` | Stable evidence chain behind one recorded validator lock |
 
 `POST /v1/audits` responses:
 
@@ -141,6 +142,41 @@ Violation types: `missing_certificate`, `invalid_signature`,
 `invalid_block_hash`, `invalid_view`, `double_vote`, `unknown_block`,
 `view_mismatch`, `unsafe_vote`.
 
+### Lock evidence
+
+`GET /v1/audits/{audit_id}/locks/{validator_hex}?view={view}` lets an auditor
+reopening a stored (possibly frozen) trace a validator's **final or
+historical** lock back to the proof that caused it, rather than trusting the
+lock summary alone. `view` must name a lock the validator actually recorded
+via an accepted `qc_observation`. The evidence is re-derived from the stored
+submission through the real replay engine, so every cited event index, block,
+view and signature comes from the replayed prefix:
+
+* `observation` — the `qc_observation` capture event that moved the lock
+  (event index, block, view, validator);
+* `certificate.formation_event` — the threshold-crossing (2f+1-th distinct)
+  vote at which the observed certificate formed;
+* `certificate.forming_votes` — every distinct signed vote that makes up the
+  certificate, each with its capture event index, block, view, validator and
+  signature;
+* `parent_chain` — the continuous certificate references from the locked
+  block's justifying certificate down the proposal parent links to the
+  implicit genesis certificate. Each hop gives the proposal event index, the
+  parent block and the referenced (`block_id`, `view`, `formed_at`,
+  `signers`) certificate with `parent_matches_certified_block: true`, so each
+  hop's parent block and certified block can be checked to agree.
+
+Errors (never back-filled from later events):
+
+* `404 not_found` — no stored audit with that id;
+* `404 unknown_validator` — the hex key is not in the audit's validator set;
+* `404 lock_view_not_found` — the validator never recorded a lock at that
+  view;
+* `409 evidence_unavailable` — the lock would only form at or after the
+  freeze violation (the replay horizon), or its chain cannot be proven from
+  the replayed prefix;
+* `400 invalid_request` — missing/malformed `view` query parameter.
+
 ## Run
 
 ```sh
@@ -161,8 +197,9 @@ performs the whole review in one run and exits with the result status:
 2. runs the lock-rule unit tests (Ed25519 vectors, consensus rules, API);
 3. waits for the healthy `audit` container and runs HTTP smoke checks:
    commit trajectories for 4 and 7 validators, reject trajectories (unsafe
-   vote, invalid signature, missing certificate), idempotent replay, and
-   conflict handling.
+   vote, invalid signature, missing certificate), idempotent replay,
+   conflict handling, and lock-evidence queries (valid historical/final
+   evidence chains plus the frozen-trace query boundaries).
 
 Exit code `0` means everything passed; any failure exits `1`.
 

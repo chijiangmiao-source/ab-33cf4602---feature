@@ -16,11 +16,14 @@ import logging
 import os
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
 
 from . import canonical, consensus, schema, store as store_mod
 
 MAX_BODY_BYTES = 1 << 20  # 1 MiB
 _AUDIT_PATH_RE = re.compile(r"^/v1/audits/([A-Za-z0-9][A-Za-z0-9._:\-]{0,127})$")
+_LOCK_EVIDENCE_PATH_RE = re.compile(
+    r"^/v1/audits/([A-Za-z0-9][A-Za-z0-9._:\-]{0,127})/locks/([0-9a-f]{64})$")
 
 LOG = logging.getLogger("lock-audit")
 
@@ -60,9 +63,14 @@ class Handler(BaseHTTPRequestHandler):
     # -- GET ------------------------------------------------------------------
 
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        raw_path, _, raw_query = self.path.partition("?")
+        path = raw_path
         if path == "/health":
             self._send_json(200, {"status": "ok", "service": "lock-audit"})
+            return
+        evidence_match = _LOCK_EVIDENCE_PATH_RE.match(path)
+        if evidence_match:
+            self._handle_lock_evidence(evidence_match, raw_query)
             return
         match = _AUDIT_PATH_RE.match(path)
         if match:
@@ -74,6 +82,53 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, verdict)
             return
         self._send_error(404, "not_found", "unknown path")
+
+    # -- lock evidence ---------------------------------------------------------
+
+    def _handle_lock_evidence(self, match, raw_query):
+        audit_id = match.group(1)
+        validator = match.group(2)
+        query = parse_qs(raw_query)
+        view_values = query.get("view", [])
+        if len(view_values) != 1:
+            self._send_error(
+                400, "invalid_request",
+                "lock evidence requires a single integer 'view' query parameter")
+            return
+        try:
+            view = int(view_values[0])
+        except ValueError:
+            view = -1
+        if view < 0:
+            self._send_error(
+                400, "invalid_request",
+                "'view' query parameter must be a non-negative integer")
+            return
+
+        verdict = self.audit_store.get(audit_id)
+        if verdict is None:
+            self._send_error(404, "not_found",
+                             "no verdict stored for this audit_id")
+            return
+        submission = self.audit_store.get_submission(audit_id)
+        if submission is None:
+            # Stored before evidence retention existed; nothing to replay.
+            self._send_error(
+                404, "not_found",
+                "stored audit carries no replayable submission")
+            return
+
+        # Re-derive through the real engine so every cited event, index and
+        # signature comes from the actual replay (and never past a freeze).
+        engine = consensus.Engine(submission)
+        engine.run()
+        try:
+            evidence = engine.lock_evidence(validator, view)
+        except consensus.EvidenceError as exc:
+            status = 409 if exc.code == consensus.EVIDENCE_UNAVAILABLE else exc.status
+            self._send_error(status, exc.code, exc.message)
+            return
+        self._send_json(200, evidence)
 
     # -- POST -----------------------------------------------------------------
 
@@ -123,7 +178,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         verdict = consensus.Engine(submission).run()
-        self.audit_store.put(audit_id, digest, verdict)
+        self.audit_store.put(audit_id, digest, verdict, submission=submission)
         verdict = dict(verdict)
         verdict["replayed"] = False
         self._send_json(201, verdict)

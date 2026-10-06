@@ -49,9 +49,23 @@ class AuditStore:
             record = self._records.get(audit_id)
             return None if record is None else dict(record["verdict"])
 
-    def put(self, audit_id: str, digest: str, verdict: dict) -> None:
+    def get_submission(self, audit_id: str):
+        """Return the original submission for a stored audit (read paths use
+        it to re-derive evidence through the real consensus engine)."""
         with self._lock:
-            self._records[audit_id] = {"digest": digest, "verdict": verdict}
+            record = self._records.get(audit_id)
+            if record is None:
+                return None
+            submission = record.get("submission")
+            return None if submission is None else json.loads(json.dumps(submission))
+
+    def put(self, audit_id: str, digest: str, verdict: dict,
+            submission: dict | None = None) -> None:
+        with self._lock:
+            record = {"digest": digest, "verdict": verdict}
+            if submission is not None:
+                record["submission"] = submission
+            self._records[audit_id] = record
             self._persist_locked()
 
     def _persist_locked(self) -> None:
